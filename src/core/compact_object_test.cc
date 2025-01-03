@@ -649,6 +649,48 @@ TEST_F(CompactObjectTest, lpGetInteger) {
   lpFree(lp);
 }
 
+class CompactObjectProactorTest : public ::testing::Test {
+ protected:
+  void SetUp() final;
+
+  void TearDown() final;
+
+  unique_ptr<fb2::ProactorBase> proactor_;
+  thread proactor_thread_;
+  CompactObj cobj_;
+};
+
+void CompactObjectProactorTest::SetUp() {
+  proactor_.reset(new fb2::EpollProactor);
+
+  proactor_thread_ = thread{[this] {
+    fb2::EpollProactor* ep = static_cast<fb2::EpollProactor*>(proactor_.get());
+    ep->Init(0);
+    InitThreadStructs();
+    ep->Run();
+  }};
+}
+
+void CompactObjectProactorTest::TearDown() {
+  proactor_->AwaitBrief([] { CheckEverythingDeallocated(); });
+  proactor_->Stop();
+  proactor_thread_.join();
+  proactor_.reset();
+}
+
+TEST_F(CompactObjectProactorTest, DellocateAsync) {
+  proactor_->AwaitBrief([this] {
+    StringSet* s = CompactObj::AllocateMR<StringSet>();
+    for (unsigned i = 0; i < 100000; ++i) {
+      s->Add(absl::StrCat("str", i));
+    }
+
+    cobj_.InitRobj(OBJ_SET, kEncodingStrMap2, s);
+    cobj_.Reset(true);
+  });
+  this_thread::sleep_for(1s);
+}
+
 static void ascii_pack_naive(const char* ascii, size_t len, uint8_t* bin) {
   const char* end = ascii + len;
 
