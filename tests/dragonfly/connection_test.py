@@ -1038,3 +1038,14 @@ async def test_lib_name_ver(async_client: aioredis.Redis):
     assert len(list) == 1
     assert list[0]["lib-name"] == "dragonfly"
     assert list[0]["lib-ver"] == "1.2.3.4"
+
+
+@dfly_args({"timeout": 1})
+async def test_timeout(df_server: DflyInstance, async_client: aioredis.Redis):
+    another_client = df_server.client()
+    await another_client.ping()
+    clients = await async_client.client_list()
+    assert len(clients) == 2
+    await asyncio.sleep(2)
+    clients = await async_client.client_list()
+    assert len(clients) == 1
