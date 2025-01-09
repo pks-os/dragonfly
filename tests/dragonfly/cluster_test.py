@@ -2580,3 +2580,91 @@ async def test_migration_timeout_on_sync(df_factory: DflyInstanceFactory, df_see
     await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
 
     assert (await StaticSeeder.capture(nodes[1].client)) == start_capture
+
+
+@dfly_args({"proactor_threads": 1, "cluster_mode": "yes", "cache_mode": "true"})
+async def test_cache_cluster_data_migration(df_factory: DflyInstanceFactory, df_seeder_factory):
+    # Check data migration from one node to another with expiration and eviction
+    instances = [
+        df_factory.create(
+            port=next(next_port),
+            admin_port=next(next_port),
+            enable_heartbeat_eviction="false",
+            vmodule="outgoing_slot_migration=2,cluster_family=2,incoming_slot_migration=2,streamer=2",
+            maxmemory="256mb" if i == 0 else "3G",
+        )
+        for i in range(2)
+    ]
+
+    df_factory.start_all(instances)
+
+    nodes = [(await create_node_info(instance)) for instance in instances]
+    nodes[0].slots = [(0, 16383)]
+    nodes[1].slots = []
+
+    await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
+
+    logging.debug("Start seeder")
+    await nodes[0].client.execute_command("DEBUG POPULATE 20000 test 10000 RAND SLOTS 0 16383")
+    # cluster_mode set to off to prevent eviction on the target node after migration is finished
+    seeder = df_seeder_factory.create(
+        keys=1000,
+        val_size=10000,
+        stop_on_failure=False,
+        port=nodes[0].instance.port,
+        cluster_mode=False,
+        multi_transaction_probability=0,
+        max_multikey=1,
+    )
+    await seeder.run(target_deviation=0.1)
+
+    # def rand_str(k=3, s=""):
+    #     # Use small k value to reduce mem usage and increase number of ops
+    #     return s.join(random.choices(string.ascii_letters, k=k))
+
+    # generate = True
+    # big_str = rand_str(10000)
+    # async def generator():
+    #     i = 0
+    #     while generate:
+    #         try:
+
+    #             await nodes[0].client.execute_command(f"SET", f"STR_COUNTER{i}", big_str)
+    #         except redis.exceptions.ResponseError:
+    #             continue
+    #         i += 1
+
+    # fill_task = asyncio.create_task(generator())
+
+    fill_task = asyncio.create_task(seeder.run())
+
+    await asyncio.sleep(10)
+
+    logging.debug("Start migration")
+    nodes[0].migrations.append(
+        MigrationInfo("127.0.0.1", nodes[1].instance.admin_port, [(0, 16383)], nodes[1].id)
+    )
+    await push_config(json.dumps(generate_config(nodes)), [node.admin_client for node in nodes])
+
+    await wait_for_status(nodes[1].admin_client, nodes[0].id, "FINISHED", 30)
+
+    logging.debug("Stop seeder")
+    # await asyncio.sleep(20)
+
+    seeder.stop()
+    # generate = False
+    await fill_task
+
+    logging.debug("drop migration for 0 node")
+    nodes[0].migrations = []
+    await push_config(json.dumps(generate_config(nodes)), [nodes[0].admin_client])
+
+    logging.debug("finish migration")
+    nodes[0].slots = []
+    nodes[1].slots = [(0, 16383)]
+    await push_config(json.dumps(generate_config(nodes)), [nodes[1].admin_client])
+
+    await asyncio.sleep(1)
+
+    source_capture = await StaticSeeder.capture(nodes[0].client)
+    assert (await StaticSeeder.capture(nodes[1].client)) == source_capture
