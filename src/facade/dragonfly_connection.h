@@ -452,6 +452,7 @@ class Connection : public util::Connection {
       bool migration_in_process_ : 1;
       bool is_http_ : 1;
       bool is_tls_ : 1;
+      bool recv_provided_ : 1;
     };
   };
 };

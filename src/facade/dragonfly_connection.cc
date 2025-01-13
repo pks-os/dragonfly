@@ -31,6 +31,8 @@
 
 #ifdef __linux__
 #include "util/fibers/uring_file.h"
+#include "util/fibers/uring_proactor.h"
+#include "util/fibers/uring_socket.h"
 #endif
 
 using namespace std;
@@ -925,6 +927,16 @@ io::Result<bool> Connection::CheckForHttpProto() {
 void Connection::ConnectionFlow() {
   DCHECK(reply_builder_);
 
+  if (!is_tls_ && socket_->proactor()->GetKind() == ProactorBase::IOURING) {
+#ifdef __linux__
+    auto* up = static_cast<fb2::UringProactor*>(socket_->proactor());
+    recv_provided_ = up->BufRingEntrySize(kRecvSockGid) > 0;
+    if (recv_provided_) {
+      auto* us = static_cast<fb2::UringSocket*>(socket_.get());
+      us->EnableRecvMultishot();
+    }
+#endif
+  }
   ++stats_->num_conns;
   ++stats_->conn_received_cnt;
   stats_->read_buf_capacity += io_buf_.Capacity();
@@ -1250,14 +1262,39 @@ error_code Connection::HandleRecvSocket() {
   phase_ = READ_SOCKET;
   error_code ec;
 
-  ::io::Result<size_t> recv_sz = socket_->Recv(append_buf);
-  last_interaction_ = time(nullptr);
+  size_t commit_sz = 0;
+  if (!is_tls_ && recv_provided_ && append_buf.size() >= kRecvBufSize) {
+    stats_->num_recv_provided_calls++;
 
-  if (!recv_sz) {
-    return recv_sz.error();
+    FiberSocketBase::ProvidedBuffer pb[1];
+    unsigned res = socket_->RecvProvided(1, pb);
+    CHECK_EQ(res, 1u);
+    if (pb[0].res_len < 0) {
+      return error_code{-pb[0].res_len, system_category()};
+    }
+
+    CHECK_GT(pb[0].res_len, 0);
+    CHECK_EQ(pb[0].type, FiberSocketBase::kBufRingType);  // We only support this type.
+    CHECK_LE(unsigned(pb[0].res_len), kRecvBufSize);   // bundles are not supported yet
+    const uint8_t* src = nullptr;
+
+#ifdef __linux__
+    fb2::UringProactor* up = static_cast<fb2::UringProactor*>(socket_->proactor());
+    src = up->GetBufRingPtr(kRecvSockGid, pb[0].bid);
+#endif
+    commit_sz = pb[0].res_len;
+    memcpy(append_buf.data(), src, commit_sz);
+    socket_->ReturnProvided(pb[0]);
+  } else {
+    ::io::Result<size_t> recv_sz = socket_->Recv(append_buf);
+    last_interaction_ = time(nullptr);
+
+    if (!recv_sz) {
+      return recv_sz.error();
+    }
+
+    commit_sz = *recv_sz;
   }
-
-  size_t commit_sz = *recv_sz;
 
   io_buf_.CommitWrite(commit_sz);
   stats_->io_read_bytes += commit_sz;
